@@ -1,4 +1,4 @@
-from itertools import chain, repeat
+from itertools import chain, repeat, islice
 from collections import defaultdict
 
 import numpy as np
@@ -42,11 +42,18 @@ def _unfreeze(*args):
 
 def _take_epochs(X, n_epochs):
     """Get a fractional number of epochs from X, rounded to the batch
-    X: torch.utils.DataLoader
+    X: torch.utils.DataLoader (has len(), iterates over batches)
     n_epochs: number of iterations through the data.
     """
     n_batches = int(np.ceil(len(X)*n_epochs))
-    n_shuffles = int(np.ceil(n_epochs))
+    _take_iters(X, n_batches)
+
+def _take_batches(X, n_batches):
+    """Get a integer number of batches from X, reshuffling as necessary
+    X: torch.utils.DataLoader (has len(), iterates over batches)
+    n_iters: number of batches
+    """
+    n_shuffles = int(np.ceil(len(X)/n_batches))
     return islice(chain.from_iterable(repeat(X,n_shuffles)),n_batches)
 
 def _wrap(x):
@@ -59,26 +66,25 @@ def _wrap(x):
     return Variable(x)
 
 class AlphaGAN(nn.Module):
-    def __init__(self, encoder, generator, D, C, latent_dim, lambd=1):
+    def __init__(self, E, G, D, C, latent_dim, lambd=1):
         """α-GAN as described in Rosca, Mihaela, et al.
             "Variational Approaches for Auto-Encoding Generative Adversarial Networks."
             arXiv preprint arXiv:1706.04987 (2017).
-        encoder: nn.Module mapping X to Z
-        generator: nn.Module mapping Z to X
+        E: nn.Module mapping X to Z
+        G: nn.Module mapping Z to X
         D: nn.module discriminating real from generated/reconstructed X
         C: nn.module discriminating prior from posterior Z
         latent_dim: dimensionality of Z
-        lambd: scale parameter for the generator distribution
+        lambd: scale parameter for the G distribution
             a.k.a weight for the reconstruction loss
         """
         super().__init__()
-        self.encoder = encoder
-        self.generator = generator
+        self.E = E
+        self.G = G
         self.D = D
         self.C = C
         self.latent_dim = latent_dim
         self.lambd = lambd
-        # self.rec_loss = nn.L1Loss()
 
     def sample_prior(self, n):
         """Sample self.latent_dim-dimensional unit normal.
@@ -113,17 +119,18 @@ class AlphaGAN(nn.Module):
                 - (1 - self.C(z) + _eps).log().mean()
         )
 
-    def fit_step(self, X, loss_fn, optimizer=None, n_epochs=1):
+    def fit_step(self, X, loss_fn, optimizer=None, n_iters=None):
         """Optimize for one epoch.
         X: torch.utils.DataLoader
         loss_fn: return dict of loss component Variables
-        optimizer: if None, just compute loss components (e.g. for validation)
-        n_epochs: fractional number of passes through the data
+        optimizer: if falsy, just compute loss components (e.g. for validation)
+        n_iters: number of batches. If falsy, use all data.
         """
         batch_losses = defaultdict(list)
         loss_name = loss_fn.__name__
+        it = _take_batches(X, n_iters) if n_iters else X
         # train discriminator
-        for x in pbar(_take_epochs(X, n_epochs), desc=loss_name, leave=False):
+        for x in pbar(it, desc=loss_name, leave=False):
             if optimizer:
                 self.zero_grad()
             loss_components = loss_fn(_wrap(x))
@@ -138,7 +145,7 @@ class AlphaGAN(nn.Module):
     def fit(self,
             X_train, X_valid=None,
             disc_opt_fn=None, ae_opt_fn=None,
-            disc_epochs=.5, ae_epochs=1,
+            disc_iters=8, ae_iters=16,
             log_fn=None,
             n_epochs=100):
         """
@@ -157,113 +164,48 @@ class AlphaGAN(nn.Module):
         """
         _unfreeze(self)
 
+        # default optimizers
         disc_opt_fn = disc_opt_fn or (lambda p: torch.optim.Adam(p, lr=3e-4))
         ae_opt_fn = ae_opt_fn or (lambda p: torch.optim.Adam(p, lr=3e-4))
 
         disc_opt = disc_opt_fn(chain(
             self.D.parameters(), self.C.parameters()))
         ae_opt = ae_opt_fn(chain(
-            self.encoder.parameters(), self.generator.parameters()))
+            self.E.parameters(), self.G.parameters()))
 
         for i in pbar(range(n_epochs), desc='epoch'):
             diagnostic = defaultdict(dict)
 
-            # train discriminator
-            _freeze(self.encoder, self.generator)
+            # train discriminators
+            self.train() # e.g. for BatchNorm
+            _freeze(self.E, self.G)
             _unfreeze(self.C, self.D)
             diagnostic['train'].update( self.fit_step(
-                X_train, self.discriminator_loss, disc_opt, disc_epochs ))
+                X_train, self.discriminator_loss, disc_opt, disc_iters ))
 
-            # train autoencoder
-            _freeze(self.C, self.D)
-            _unfreeze(self.encoder, self.generator)
-            diagnostic['train'].update( self.fit_step(
-                X_train, self.autoencoder_loss, ae_opt, ae_epochs ))
-
-            # validation
-            _freeze(self)
+            # validate discriminators
             if not X_valid is None:
+                self.eval()
+                _freeze(self)
                 diagnostic['valid'].update( self.fit_step(
                     X_valid, self.discriminator_loss ))
+
+            # train autoencoder
+            self.train()
+            _freeze(self.C, self.D)
+            _unfreeze(self.E, self.G)
+            diagnostic['train'].update( self.fit_step(
+                X_train, self.autoencoder_loss, ae_opt, ae_iters ))
+
+            # validate autoencoder
+            if not X_valid is None:
+                self.eval()
+                _freeze(self)
                 diagnostic['valid'].update( self.fit_step(
                     X_valid, self.autoencoder_loss ))
 
             # log the dict of losses
             log_fn(diagnostic)
-
-    # def encoder_loss(self, x):
-    #     """Loss for step 4 of algorithm 1"""
-    #     z, x_rec = self(x)
-    #     return self.rec_loss(x_rec, x) - self.C(z).log().mean()
-    #
-    # def generator_loss(self,x):
-    #     """Loss for step 5 of algorithm 1"""
-    #     z_prior, x_prior = self(len(x), mode='sample')
-    #     z, x_rec = self(x)
-    #     return self.rec_loss(x_rec, x) - self.D(
-    #          torch.cat((x_prior, x_rec), 0)
-    #     ).log().mean()
-
-    # def D_loss(self, x):
-    #     """Loss for step 6 of algorithm 1"""
-    #     z_prior, x_prior = self(len(x), mode='sample')
-    #     z, x_rec = self(x)
-    #     return (
-    #         - self.D(x).log().mean()
-    #         - (1 - self.D( torch.cat((x_prior, x_rec), 0) )).log().mean()
-    #     )
-    #
-    # def C_loss(self, x):
-    #     """Loss for step 7 of algorithm 1"""
-    #     z_prior = self.sample_prior(len(x))
-    #     z = self.encoder(x)
-    #     return (
-    #         - self.C(z).log()
-    #         - (1-self.C(z_prior)).log()
-    #     ).mean()
-
-    # def fit(self,
-    #         X_train, X_valid=None,
-    #         optim_fns=None,
-    #         epoch_len=[1,2,1,1],
-    #         log_fn=None,
-    #         n_epochs=100):
-    #     _unfreeze(self)
-    #     optim_fns = optim_fns or [lambda p: torch.optim.Adam(p, lr=2e-4)]*4
-    #     modules = [self.encoder, self.generator, self.D, self.C]
-    #     optimizers = [opt(m.parameters()) for opt, m in zip(optim_fns, modules)]
-    #     loss_fns = [
-    #         self.encoder_loss, self.generator_loss, self.D_loss, self.C_loss
-    #     ]
-    #     for i in pbar(range(n_epochs), desc='epoch'):
-    #         diagnostic = {}
-    #         for mod, n, optimizer, loss_fn in zip(
-    #             modules, epoch_len, optimizers, loss_fns
-    #             ):
-    #             ################ DEBUG
-    #             if mod==self.D: continue
-    #             if mod==self.C: continue
-    #             ################
-    #             _freeze(self)
-    #             _unfreeze(mod)
-    #             batch_losses = []
-    #             it_name = loss_fn.__name__
-    #             # training
-    #             for x in pbar(
-    #                 _take_epochs(X_train,n), desc=it_name, leave=False
-    #                 ):
-    #                 self.zero_grad()
-    #                 loss = loss_fn(_wrap(x))
-    #                 loss.backward()
-    #                 optimizer.step()
-    #                 batch_losses.append(loss.data.cpu().numpy())
-    #             diagnostic['train_'+it_name] = np.mean(batch_losses)
-    #             # validation
-    #             if not X_valid is None:
-    #                 diagnostic['valid_'+it_name] = np.mean([
-    #                     loss_fn(x).data.cpu().numpy() for x in X_valid ])
-    #         # log the dict of losses
-    #         log_fn(diagnostic)
 
     def forward(self, *args, mode=None):
         """
@@ -282,12 +224,12 @@ class AlphaGAN(nn.Module):
             z = _wrap(args[0])
         else:
             x = _wrap(args[0])
-            z = self.encoder(x)
+            z = self.E(x)
         # step there if reconstruction not desired
         if mode=='encode':
             return z
-        # run code through generator
-        x_rec = self.generator(z)
+        # run code through G
+        x_rec = self.G(z)
         if mode=='reconstruct' or mode=='generate':
             return x_rec
         # None, 'sample' return code and reconstruction

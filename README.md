@@ -20,7 +20,8 @@ alphagan/examples/CIFAR.ipynb
 
 ## Usage
 
-```from alphagan import AlphaGAN
+```#
+from alphagan import AlphaGAN
 
 encoder, generator, D, C = ... #torch.nn.Module
 
@@ -38,8 +39,6 @@ z_valid, x_recon = model(X_valid[0])
 # sample from the generative model
 z, x_gen = model(batch_size, mode='sample')
 ```
-
-### Generic
 
 Supply any torch.nn.Module decoder, generator, discriminator, and code discriminator at construction and any torch.optim.Optimizer and torch.utils.DataLoader to fit().
 
