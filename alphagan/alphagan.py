@@ -102,9 +102,9 @@ class AlphaGAN(nn.Module):
         z, x_rec = self(x)
         xs = torch.cat((x_prior, x_rec), 0)
         return dict(
-            reconstruction = self.rec_loss(x_rec, x),
-            adversarial = -(self.D(xs) + _eps).log().mean(),
-            code = -(self.C(z) + _eps).log().mean()
+            reconstruction_loss = self.rec_loss(x_rec, x),
+            adversarial_loss = -(self.D(xs) + _eps).log().mean(),
+            code_adversarial_loss = -(self.C(z) + _eps).log().mean()
         )
 
     def discriminator_loss(self, x):
@@ -113,61 +113,84 @@ class AlphaGAN(nn.Module):
         z, x_rec = self(x)
         xs = torch.cat((x_prior, x_rec), 0)
         return dict(
-            D = - (self.D(x) + _eps).log().mean()
+            discriminator_loss = - (self.D(x) + _eps).log().mean()
                 - (1 - self.D(xs) + _eps).log().mean(),
-            C = - (self.C(z_prior) + _eps).log().mean()
+            code_discriminator_loss = - (self.C(z_prior) + _eps).log().mean()
                 - (1 - self.C(z) + _eps).log().mean()
         )
 
-    def fit_step(self, X, loss_fn, optimizer=None, n_iters=None):
-        """Optimize for one epoch.
-        X: torch.utils.DataLoader
-        loss_fn: return dict of loss component Variables
-        optimizer: if falsy, just compute loss components (e.g. for validation)
-        n_iters: number of batches. If falsy, use all data.
+    def _epoch(self, X, disc_opt=None, ae_opt=None,
+                 n_batches=None, n_iter=(1,1)):
+        """Evaluate/optimize for one epoch.
+        X: torch.nn.DataLoader
+        disc_opt: torch.nn.Optimizer for discriminators or None if not training
+        ae_opt: torch.nn.Optimizer for autoencoder or None if not training
+        n_batches: number of batches to draw or None for all data
+        n_iter: tuple of steps per batch for discriminators, autoencoder
         """
-        batch_losses = defaultdict(list)
-        loss_name = loss_fn.__name__
-        it = _take_batches(X, n_iters) if n_iters else X
-        # train discriminator
-        for x in pbar(it, desc=loss_name, leave=False):
-            if optimizer:
+        iter_losses = defaultdict(list)
+        it = _take_batches(X, n_batches) if n_batches else X
+        desc = 'training batch' if disc_opt else 'validating batch'
+        for x in pbar(it, desc=desc, leave=False):
+            x = _wrap(x)
+            for i in range(n_iter[0]):
                 self.zero_grad()
-            loss_components = loss_fn(_wrap(x))
-            if optimizer:
-                loss = sum(loss_components.values())
-                loss.backward()
-                optimizer.step()
-            for k,v in loss_components.items():
-                batch_losses[k].append(v.data.cpu().numpy())
-        return {k+'_'+loss_name:np.mean(v) for k,v in batch_losses.items()}
+                _freeze(self.E, self.G)
+                _unfreeze(self.C, self.D)
+                loss_components = self.discriminator_loss(x)
+                if disc_opt:
+                    loss = sum(loss_components.values())
+                    loss.backward()
+                    disc_opt.step()
+                    del loss
+                for k,v in loss_components.items():
+                    iter_losses[k].append(v.data.cpu().numpy())
+            for _ in range(n_iter[1]):
+                self.zero_grad()
+                _freeze(self.C, self.D)
+                _unfreeze(self.E, self.G)
+                loss_components = self.autoencoder_loss(x)
+                if ae_opt:
+                    loss = sum(loss_components.values())
+                    loss.backward()
+                    ae_opt.step()
+                    del loss
+                for k,v in loss_components.items():
+                    iter_losses[k].append(v.data.cpu().numpy())
+        return {k:np.mean(v) for k,v in iter_losses.items()}
 
     def fit(self,
             X_train, X_valid=None,
             disc_opt_fn=None, ae_opt_fn=None,
-            disc_iters=8, ae_iters=16,
-            log_fn=None,
-            n_epochs=100):
+            n_iter=1, n_batches=None, n_epochs=100,
+            log_fn=None, report_every=1):
         """
         X_train: torch.utils.data.DataLoader
         X_valid: torch.utils.data.DataLoader or None
         disc_opt_fn: takes parameter set, returns torch.optim.Optimizer
-            if None, a default Optimizer will be used
+            if None, a default optimizer will be used
         ae_opt_fn: takes parameter set, returns torch.optim.Optimizer
-            if None, a default Optimizer will be used
-        disc_epochs: number of discriminator passes through the data each epoch
-            (may be fractional)
-        ae_epochs: number of autoencoder passes through the data each epoch
-            (may be fractional)
+            if None, a default optimizer will be used
+        n_iter: int/tuple # of discriminator, autoencoder optimizer steps/batch
+        n_batches: # of batches per epoch or None for all data
         log_fn: takes diagnostic dict, called after every epoch
         n_epochs: number of discriminator, autoencoder training iterations
+
         """
         _unfreeze(self)
 
-        # default optimizers
-        disc_opt_fn = disc_opt_fn or (lambda p: torch.optim.Adam(p, lr=3e-4))
-        ae_opt_fn = ae_opt_fn or (lambda p: torch.optim.Adam(p, lr=3e-4))
+        try:
+            assert len(n_iter)==2
+        except Exception:
+            n_iter = (n_iter,)*2
 
+        # default optimizers
+        disc_opt_fn = disc_opt_fn or (lambda p: torch.optim.Adam(
+            p, lr=2e-4, betas=(.5,.9)
+        ))
+        ae_opt_fn = ae_opt_fn or (lambda p: torch.optim.Adam(
+            p, lr=2e-4, betas=(.5,.9)
+        ))
         disc_opt = disc_opt_fn(chain(
             self.D.parameters(), self.C.parameters()))
         ae_opt = ae_opt_fn(chain(
@@ -175,37 +198,21 @@ class AlphaGAN(nn.Module):
 
         for i in pbar(range(n_epochs), desc='epoch'):
             diagnostic = defaultdict(dict)
+            report = i%report_every==0 or i==n_epochs-1
 
-            # train discriminators
-            self.train() # e.g. for BatchNorm
-            _freeze(self.E, self.G)
-            _unfreeze(self.C, self.D)
-            diagnostic['train'].update( self.fit_step(
-                X_train, self.discriminator_loss, disc_opt, disc_iters ))
-
-            # validate discriminators
-            if not X_valid is None:
-                self.eval()
-                _freeze(self)
-                diagnostic['valid'].update( self.fit_step(
-                    X_valid, self.discriminator_loss ))
-
-            # train autoencoder
+            # train for one epoch
             self.train()
-            _freeze(self.C, self.D)
-            _unfreeze(self.E, self.G)
-            diagnostic['train'].update( self.fit_step(
-                X_train, self.autoencoder_loss, ae_opt, ae_iters ))
+            diagnostic['train'].update( self._epoch(
+                X_train, disc_opt, ae_opt,
+                n_batches=n_batches, n_iter=n_iter ))
 
-            # validate autoencoder
-            if not X_valid is None:
-                self.eval()
-                _freeze(self)
-                diagnostic['valid'].update( self.fit_step(
-                    X_valid, self.autoencoder_loss ))
+            # validate for one epoch
+            self.eval()
+            diagnostic['valid'].update(self._epoch(X_valid))
 
             # log the dict of losses
-            log_fn(diagnostic)
+            if report:
+                log_fn(diagnostic)
 
     def forward(self, *args, mode=None):
         """

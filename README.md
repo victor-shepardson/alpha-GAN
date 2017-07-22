@@ -1,7 +1,7 @@
 # alpha-GAN
 pytorch implementation of Rosca, Mihaela, et al. "Variational Approaches for Auto-Encoding Generative Adversarial Networks." arXiv preprint arXiv:1706.04987 (2017).
 
-work in progress.
+**work in progress. paper results not yet reproduced**
 
 ## Deviations From The Paper
 
@@ -11,8 +11,7 @@ Algorithm 1 in the paper is generally vague as to how each network should be upd
 
 - Encoder and generator are trained jointly
 - Discriminator and code discriminator are trained jointly
-- Discriminators are updated before encoder/generator
-- Training alternates full passes through the data (as apposed to updating each network every batch)
+- As in other GAN implementations, discriminator is updated first, then generator for each batch.
 
 ## Examples
 
