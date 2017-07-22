@@ -81,7 +81,7 @@ class AlphaGAN(nn.Module):
         """Sample self.latent_dim-dimensional unit normal.
         n: batch size
         """
-        return Variable(torch.randn(n, self.latent_dim), requires_grad=False)
+        return self._wrap(torch.randn(n, self.latent_dim))#, requires_grad=False)
 
     def rec_loss(self, x_rec, x):
         """L1 reconstruction error or Laplace log likelihood"""
@@ -234,7 +234,7 @@ class AlphaGAN(nn.Module):
         return z, x_rec
 
     def is_cuda(self):
-        return self.E[0].weight.is_cuda()
+        return self.E[0].weight.is_cuda
 
     def _wrap(self, x):
         """ensure x is a Variable on the correct device"""
