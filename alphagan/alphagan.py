@@ -56,15 +56,6 @@ def _take_batches(X, n_batches):
     n_shuffles = int(np.ceil(len(X)/n_batches))
     return islice(chain.from_iterable(repeat(X,n_shuffles)),n_batches)
 
-def _wrap(x):
-    """ensure x is a Variable."""
-    if isinstance(x, Variable):
-        return x
-    # if x isn't a Tensor, attempt to construct one from it
-    if not isinstance(x, torch._TensorBase):
-        x = torch.Tensor(x)
-    return Variable(x)
-
 class AlphaGAN(nn.Module):
     def __init__(self, E, G, D, C, latent_dim, lambd=1):
         """α-GAN as described in Rosca, Mihaela, et al.
@@ -132,7 +123,7 @@ class AlphaGAN(nn.Module):
         it = _take_batches(X, n_batches) if n_batches else X
         desc = 'training batch' if disc_opt else 'validating batch'
         for x in pbar(it, desc=desc, leave=False):
-            x = _wrap(x)
+            x = self._wrap(x)
             for i in range(n_iter[0]):
                 self.zero_grad()
                 _freeze(self.E, self.G)
@@ -228,9 +219,9 @@ class AlphaGAN(nn.Module):
             n = args[0]
             z = self.sample_prior(n)
         elif mode=='generate':
-            z = _wrap(args[0])
+            z = self._wrap(args[0])
         else:
-            x = _wrap(args[0])
+            x = self._wrap(args[0])
             z = self.E(x)
         # step there if reconstruction not desired
         if mode=='encode':
@@ -241,3 +232,17 @@ class AlphaGAN(nn.Module):
             return x_rec
         # None, 'sample' return code and reconstruction
         return z, x_rec
+
+    def is_cuda(self):
+        return self.E[0].weight.is_cuda()
+
+    def _wrap(self, x):
+        """ensure x is a Variable on the correct device"""
+        if not isinstance(x, Variable):
+            # if x isn't a Tensor, attempt to construct one from it
+            if not isinstance(x, torch._TensorBase):
+                x = torch.Tensor(x)
+            x = Variable(x)
+        if self.is_cuda():
+            x = x.cuda()
+        return x
