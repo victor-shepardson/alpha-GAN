@@ -154,7 +154,8 @@ class AlphaGAN(nn.Module):
             X_train, X_valid=None,
             disc_opt_fn=None, ae_opt_fn=None,
             n_iter=1, n_batches=None, n_epochs=100,
-            log_fn=None, report_every=1):
+            log_fn=None, log_every=1,
+            checkpoint_fn=None, checkpoint_every=10):
         """
         X_train: torch.utils.data.DataLoader
         X_valid: torch.utils.data.DataLoader or None
@@ -164,9 +165,11 @@ class AlphaGAN(nn.Module):
             if None, a default optimizer will be used
         n_iter: int/tuple # of discriminator, autoencoder optimizer steps/batch
         n_batches: # of batches per epoch or None for all data
-        log_fn: takes diagnostic dict, called after every epoch
         n_epochs: number of discriminator, autoencoder training iterations
-
+        log_fn: takes diagnostic dict, called after every nth epoch
+        log_every: call log function every nth epoch
+        checkpoint_fn: takes model, epoch. called after nth every epoch
+        checkpoint_every: call checkpoint function every nth epoch
         """
         _unfreeze(self)
 
@@ -189,7 +192,9 @@ class AlphaGAN(nn.Module):
 
         for i in pbar(range(n_epochs), desc='epoch'):
             diagnostic = defaultdict(dict)
-            report = i%report_every==0 or i==n_epochs-1
+            report = log_fn and (i%log_every==0 or i==n_epochs-1)
+            checkpoint = checkpoint_every and checkpoint_fn and (
+                (i+1)%checkpoint_every==0 or i==n_epochs-1 )
 
             # train for one epoch
             self.train()
@@ -204,6 +209,9 @@ class AlphaGAN(nn.Module):
             # log the dict of losses
             if report:
                 log_fn(diagnostic)
+
+            if checkpoint:
+                checkpoint_fn(self, i+1)
 
     def forward(self, *args, mode=None):
         """
