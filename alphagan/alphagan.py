@@ -57,7 +57,8 @@ def _take_batches(X, n_batches):
     return islice(chain.from_iterable(repeat(X,n_shuffles)),n_batches)
 
 class AlphaGAN(nn.Module):
-    def __init__(self, E, G, D, C, latent_dim, lambd=1):
+    def __init__(self, E, G, D, C, latent_dim,
+                 lambd=1, z_lambd=0, code_weight=1, adversarial_weight=1):
         """α-GAN as described in Rosca, Mihaela, et al.
             "Variational Approaches for Auto-Encoding Generative Adversarial Networks."
             arXiv preprint arXiv:1706.04987 (2017).
@@ -68,6 +69,9 @@ class AlphaGAN(nn.Module):
         latent_dim: dimensionality of Z
         lambd: scale parameter for the G distribution
             a.k.a weight for the reconstruction loss
+        z_lambd: if nonzero, weight for code reconstruction loss
+        code_weight: weight for code loss. if zero, C won't be trained
+        adversarial_weight: weight for adversarial loss. if zero, D won't be trained
         """
         super().__init__()
         self.E = E
@@ -76,6 +80,9 @@ class AlphaGAN(nn.Module):
         self.C = C
         self.latent_dim = latent_dim
         self.lambd = lambd
+        self.z_lambd = z_lambd
+        self.code_weight = code_weight
+        self.adversarial_weight = adversarial_weight
 
     def sample_prior(self, n):
         """Sample self.latent_dim-dimensional unit normal.
@@ -85,85 +92,100 @@ class AlphaGAN(nn.Module):
 
     def rec_loss(self, x_rec, x):
         """L1 reconstruction error or Laplace log likelihood"""
-        return self.lambd * (x_rec-x).abs().mean()
-
+        return (x_rec-x).abs().mean()
+    
     def autoencoder_loss(self, x):
         """Return reconstruction loss, adversarial loss"""
+        _freeze(self) # save memory by excluding parameters from autograd
+        _unfreeze(self.E, self.G)
         z_prior, x_prior = self(len(x), mode='sample')
         z, x_rec = self(x)
         xs = torch.cat((x_prior, x_rec), 0)
-        return dict(
-            reconstruction_loss = self.rec_loss(x_rec, x),
-            adversarial_loss = -(self.D(xs) + _eps).log().mean(),
-            code_adversarial_loss = -(self.C(z) + _eps).log().mean()
-        )
+#         return dict(
+#             reconstruction_loss = self.rec_loss(x_rec, x),
+#             adversarial_loss = -(self.D(xs) + _eps).log().mean(),
+#             code_adversarial_loss = -(self.C(z) + _eps).log().mean()
+#         )
+        ret = {}
+        if self.code_weight != 0:
+            ret['code_adversarial_loss'] = -(self.C(z) + _eps).log().mean()
+        if self.adversarial_weight != 0:
+            ret['adversarial_loss'] = -(self.D(xs) + _eps).log().mean()
+        if self.lambd != 0:
+            ret['reconstruction_loss'] = self.lambd*self.rec_loss(x_rec, x)
+        if self.z_lambd != 0:
+            zs = torch.cat((z_prior, z), 0)
+            z_rec = self(xs, mode='encode')
+            ret['code_reconstruction_loss'] = self.z_lambd*self.rec_loss(z_rec, zs)
+        return ret
 
     def discriminator_loss(self, x):
-        """Return discriminator (D) loss, code discriminator (C) loss"""
+        """Return discriminator (D) loss"""
+        _freeze(self) # save memory by excluding parameters from autograd
+        _unfreeze(self.D)
         z_prior, x_prior = self(len(x), mode='sample')
         z, x_rec = self(x)
         xs = torch.cat((x_prior, x_rec), 0)
-        return dict(
-            discriminator_loss = - (self.D(x) + _eps).log().mean()
-                - (1 - self.D(xs) + _eps).log().mean(),
-            code_discriminator_loss = - (self.C(z_prior) + _eps).log().mean()
-                - (1 - self.C(z) + _eps).log().mean()
-        )
+        return {
+            'discriminator_loss':
+                - (self.D(x) + _eps).log().mean()
+                - (1 - self.D(xs) + _eps).log().mean()
+        }
 
-    def _epoch(self, X, disc_opt=None, ae_opt=None,
-                 n_batches=None, n_iter=(1,1)):
+    def code_discriminator_loss(self, x):
+        """Return code discriminator (C) loss"""
+        _freeze(self) # save memory by excluding parameters from autograd
+        _unfreeze(self.C)
+        z_prior = self.sample_prior(len(x))
+        z = self(x, mode='encode')
+        return {
+            'code_discriminator_loss':
+                - (self.C(z_prior) + _eps).log().mean()
+                - (1 - self.C(z) + _eps).log().mean()
+        }
+
+    def _epoch(self, X, loss_fns,
+               optimizers=None, n_iter=(1,1,1), n_batches=None):
         """Evaluate/optimize for one epoch.
         X: torch.nn.DataLoader
-        disc_opt: torch.nn.Optimizer for discriminators or None if not training
-        ae_opt: torch.nn.Optimizer for autoencoder or None if not training
+        loss_fns: each takes an input batch and returns dict of loss component Variables
+        optimizers: sequence of torch.nn.Optimizer for each loss or None if not training
+        n_iter: sequence of optimization steps per batch for each loss
         n_batches: number of batches to draw or None for all data
-        n_iter: tuple of steps per batch for discriminators, autoencoder
         """
+        optimizers = optimizers or [None]*3
         iter_losses = defaultdict(list)
+        
         it = _take_batches(X, n_batches) if n_batches else X
-        desc = 'training batch' if disc_opt else 'validating batch'
+        desc = 'training batch' if optimizers else 'validating batch'
         for x in pbar(it, desc=desc, leave=False):
             x = self._wrap(x)
-            for i in range(n_iter[0]):
-                self.zero_grad()
-                _freeze(self.E, self.G)
-                _unfreeze(self.C, self.D)
-                loss_components = self.discriminator_loss(x)
-                if disc_opt:
-                    loss = sum(loss_components.values())
-                    loss.backward()
-                    disc_opt.step()
-                    del loss
-                for k,v in loss_components.items():
-                    iter_losses[k].append(v.data.cpu().numpy())
-            for _ in range(n_iter[1]):
-                self.zero_grad()
-                _freeze(self.C, self.D)
-                _unfreeze(self.E, self.G)
-                loss_components = self.autoencoder_loss(x)
-                if ae_opt:
-                    loss = sum(loss_components.values())
-                    loss.backward()
-                    ae_opt.step()
-                    del loss
-                for k,v in loss_components.items():
-                    iter_losses[k].append(v.data.cpu().numpy())
+            for opt, iters, loss_fn in zip(optimizers, n_iter, loss_fns):
+                for _ in range(iters):
+                    loss_components = loss_fn(x)
+                    if opt:
+                        loss = sum(loss_components.values())
+                        self.zero_grad()
+                        loss.backward()
+                        opt.step()
+                        del loss
+                    for k,v in loss_components.items():
+                        iter_losses[k].append(v.data.cpu().numpy())
+                    del loss_components
         return {k:np.mean(v) for k,v in iter_losses.items()}
 
     def fit(self,
             X_train, X_valid=None,
-            disc_opt_fn=None, ae_opt_fn=None,
+            EG_opt_fn=None, D_opt_fn=None, C_opt_fn=None,
             n_iter=1, n_batches=None, n_epochs=100,
             log_fn=None, log_every=1,
             checkpoint_fn=None, checkpoint_every=10):
         """
         X_train: torch.utils.data.DataLoader
         X_valid: torch.utils.data.DataLoader or None
-        disc_opt_fn: takes parameter set, returns torch.optim.Optimizer
+        EG_opt_fn, D_opt_fn, C_opt_fn: takes parameter set, returns torch.optim.Optimizer
             if None, a default optimizer will be used
-        ae_opt_fn: takes parameter set, returns torch.optim.Optimizer
-            if None, a default optimizer will be used
-        n_iter: int/tuple # of discriminator, autoencoder optimizer steps/batch
+        n_iter: int/tuple # of E/G, D, C optimizer steps/batch
         n_batches: # of batches per epoch or None for all data
         n_epochs: number of discriminator, autoencoder training iterations
         log_fn: takes diagnostic dict, called after every nth epoch
@@ -174,42 +196,57 @@ class AlphaGAN(nn.Module):
         _unfreeze(self)
 
         try:
-            assert len(n_iter)==2
-        except Exception:
-            n_iter = (n_iter,)*2
+            assert len(n_iter)==3
+        except TypeError:
+            n_iter = (n_iter,)*3
 
         # default optimizers
-        disc_opt_fn = disc_opt_fn or (lambda p: torch.optim.Adam(
-            p, lr=2e-4, betas=(.5,.9)
+        EG_opt_fn = EG_opt_fn or (lambda p: torch.optim.Adam(
+            p, lr=8e-4, betas=(.5,.9)
         ))
-        ae_opt_fn = ae_opt_fn or (lambda p: torch.optim.Adam(
-            p, lr=2e-4, betas=(.5,.9)
+        D_opt_fn = D_opt_fn or (lambda p: torch.optim.Adam(
+            p, lr=8e-4, betas=(.5,.9)
         ))
-        disc_opt = disc_opt_fn(chain(
-            self.D.parameters(), self.C.parameters()))
-        ae_opt = ae_opt_fn(chain(
-            self.E.parameters(), self.G.parameters()))
+        C_opt_fn = C_opt_fn or (lambda p: torch.optim.Adam(
+            p, lr=8e-4, betas=(.5,.9)
+        ))
+        
+        # define optimization order/separation of networks
+        optimizers, loss_fns = [], []
+        # encoder/generator together
+        optimizers.append(EG_opt_fn(chain(
+            self.E.parameters(), self.G.parameters()
+        )))
+        loss_fns.append(self.autoencoder_loss)
+        # discriminator
+        if self.adversarial_weight != 0:
+            optimizers.append(D_opt_fn(self.D.parameters()))
+            loss_fns.append(self.discriminator_loss)
+        # code discriminator
+        if self.code_weight != 0:
+            optimizers.append(C_opt_fn(self.C.parameters()))
+            loss_fns.append(self.code_discriminator_loss)
+# #         discriminators together
+#         optimizers.append(D_opt_fn(chain(
+#             self.D.parameters(), self.C.parameters()
+#         )))
+#         loss_fns.append(lambda x: self.code_discriminator_loss(x)+self.discriminator_loss(x))
 
         for i in pbar(range(n_epochs), desc='epoch'):
             diagnostic = defaultdict(dict)
             report = log_fn and (i%log_every==0 or i==n_epochs-1)
             checkpoint = checkpoint_every and checkpoint_fn and (
                 (i+1)%checkpoint_every==0 or i==n_epochs-1 )
-
             # train for one epoch
             self.train()
             diagnostic['train'].update( self._epoch(
-                X_train, disc_opt, ae_opt,
-                n_batches=n_batches, n_iter=n_iter ))
-
+                X_train, loss_fns, optimizers, n_iter, n_batches ))
             # validate for one epoch
             self.eval()
-            diagnostic['valid'].update(self._epoch(X_valid))
-
-            # log the dict of losses
+            diagnostic['valid'].update(self._epoch(X_valid, loss_fns))
+            # log the dict of loss components
             if report:
                 log_fn(diagnostic)
-
             if checkpoint:
                 checkpoint_fn(self, i+1)
 
@@ -238,7 +275,7 @@ class AlphaGAN(nn.Module):
         x_rec = self.G(z)
         if mode=='reconstruct' or mode=='generate':
             return x_rec
-        # None, 'sample' return code and reconstruction
+        # default, 'sample': return code and reconstruction
         return z, x_rec
 
     def is_cuda(self):
@@ -254,3 +291,60 @@ class AlphaGAN(nn.Module):
         if self.is_cuda():
             x = x.cuda()
         return x
+
+# # experiment with using WGAN-GP for the GAN losses
+# # requires pytorch > 0.12.2 (current master)
+# class AlphaWGAN(AlphaGAN):
+#     """Alternative WGAN-GP based losses"""
+#     def gradient_penalty(self, model, x, x_prior, w=10):
+#         """WGAN-GP gradient penalty"""
+#         alpha = self._wrap(torch.rand(len(x)))
+#         x_hat = x*alpha + x_prior*(1-alpha)
+#         scores = model(x_hat).sum()
+# #         ones = self._wrap(torch.ones(x.size()))
+#         grad = torch.autograd.grad(
+#             scores, x_hat,
+# #             grad_outputs=ones,
+#             create_graph=True, only_inputs=True)
+#         grad_norm_dist = grad.norm(2, dim=1) - 1
+#         return w*grad_norm_dist*grad_norm_dist
+    
+#     def autoencoder_loss(self, x):
+#         """Return reconstruction loss, adversarial loss"""
+#         _freeze(self) # save memory by excluding parameters from autograd
+#         _unfreeze(self.E, self.G)
+#         z_prior, x_prior = self(len(x), mode='sample')
+#         z, x_rec = self(x)
+#         xs = torch.cat((x_prior, x_rec), 0)
+#         return dict(
+#             reconstruction_loss = self.rec_loss(x_rec, x),
+#             adversarial_loss = -self.D(xs).mean(),
+#             code_adversarial_loss = -self.C(z).mean()
+#         )
+
+#     def discriminator_loss(self, x):
+#         """Return discriminator (D) loss"""
+#         _freeze(self) # save memory by excluding parameters from autograd
+#         _unfreeze(self.D)
+#         z_prior, x_prior = self(len(x), mode='sample')
+#         z, x_rec = self(x)
+#         xs = torch.cat((x_prior, x_rec), 0)
+#         return dict(
+#             discriminator_loss = 
+#                 + self.D(xs).mean()
+#                 - self.D(x).mean() 
+#                 + self.gradient_penalty(self.D, x, x_prior)
+#         )
+
+#     def code_discriminator_loss(self, x):
+#         """Return code discriminator (C) loss"""
+#         _freeze(self) # save memory by excluding parameters from autograd
+#         _unfreeze(self.C)
+#         z_prior = self.sample_prior(len(x))
+#         z = self(x, mode='encode')
+#         return dict(
+#             code_discriminator_loss = 
+#                 + self.C(z).mean() 
+#                 - self.C(z_prior).mean()
+#                 + self.gradient_penalty(self.C, z, z_prior)
+#         )

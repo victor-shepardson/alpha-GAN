@@ -1,17 +1,19 @@
 # alpha-GAN
-pytorch implementation of Rosca, Mihaela, et al. "Variational Approaches for Auto-Encoding Generative Adversarial Networks." arXiv preprint arXiv:1706.04987 (2017).
+Unofficial pytorch implementation of Rosca, Mihaela, et al. "Variational Approaches for Auto-Encoding Generative Adversarial Networks." arXiv preprint arXiv:1706.04987 (2017).
 
 **I've got visually reasonable results on CIFAR-100 (see notebook). Having difficulty getting both good reconstructions and diverse, natural-looking samples at once though.**
 
 ## Deviations From The Paper
 
-In the original paper, prior and posterior terms appear to be swapped in the code discriminator loss (equations 16 and 17 in Algorithm 1).
+In the original paper (v1 on arXiv), prior and posterior terms are be swapped in the code discriminator loss (equations 16 and 17 in Algorithm 1). Authors have confirmed.
 
-Algorithm 1 in the paper is generally vague as to how each network should be updated. In this implementation:
+Algorithm 1 in the paper is vague as to how each network should be updated; it doesn't explain how SGD enter the picture, or the details of optimization. The authors have confirmed that each of the four networks is updated separately in their experiments. However, in this implementation:
 
-- Encoder and generator are trained jointly
-- Discriminator and code discriminator are trained jointly
+- Encoder and generator are updated jointly
+- Discriminator and code discriminator are updated jointly
 - As in other GAN implementations, discriminator is updated first, then generator for each batch.
+
+It may be worth revisiting the sequence and separation of optimizers.
 
 ## Basic Usage
 
