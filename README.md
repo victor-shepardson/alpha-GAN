@@ -5,9 +5,11 @@ Unofficial pytorch implementation of Rosca, Mihaela, et al. "Variational Approac
 
 ## Deviations From The Paper
 
-In the original paper (v1 on arXiv), prior and posterior terms are be swapped in the code discriminator loss (equations 16 and 17 in Algorithm 1). Authors have confirmed.
+In the original paper (v1 on arXiv), prior and posterior terms are swapped in the code discriminator loss (equations 16 and 17 in Algorithm 1). Authors have confirmed.
 
-Algorithm 1 in the paper is vague as to how each network should be updated; it doesn't explain how SGD enter the picture, or the details of optimization. The authors have confirmed that each of the four networks is updated separately in their experiments. However, in this implementation, encoder and generator (E and G networks) are updated jointly and share an optimizer. It may be worth revisiting the sequence and separation of optimizers.
+Algorithm 1 in the paper is vague as to how each network should be updated; it doesn't account for SGD. The authors have confirmed that each of the four networks is updated separately in their experiments. However, in this implementation, encoder and generator (E and G networks) are updated jointly and share an optimizer. It may be worth revisiting the sequence and separation of optimizers.
+
+This implementation adds the latent space cycle loss alluded to in the paper via an option hyperparameter `z_lambd`. When `z_lambd` is nonzero, generated and reconstructed _x_ will be run through the encoder and compared to the original sampled and encoded z.
 
 ## Basic Usage
 
@@ -27,7 +29,7 @@ train_loader, valid_loader = ... #torch.utils.data.DataLoader
 model.fit(train_loader, valid_loader, n_iter=(2,1,1), n_epochs=4, log_fn=print)
 
 # encode and reconstruct
-z_valid, x_recon = model(X_valid[0].unsqueeze(0))
+z_valid, x_recon = model(X_valid[:batch_size])
 
 # sample from the generative model
 z, x_gen = model(batch_size, mode='sample')
