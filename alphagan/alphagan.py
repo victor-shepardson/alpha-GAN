@@ -33,14 +33,14 @@ _eps = 1e-15
 
 def _freeze(*args):
     for module in args:
-        if not module: continue
-        for p in module.parameters():
-            p.requires_grad = False
+        if module:
+            for p in module.parameters():
+                p.requires_grad = False
 def _unfreeze(*args):
     for module in args:
-        if not module: continue
-        for p in module.parameters():
-            p.requires_grad = True
+        if module:
+            for p in module.parameters():
+                p.requires_grad = True
 
 def _as_tuple(x,n):
     if not isinstance(x, tuple):
@@ -118,13 +118,13 @@ class AlphaGAN(nn.Module):
             x_fake = x_gen = self.G(zs)
         
         ret = {}
-        if self.code_weight != 0:
+        if self.use_C():
             ret['code_adversarial_loss'] = -(self.C(z) + _eps).log().mean()
         if self.adversarial_weight != 0:
             ret['adversarial_loss'] = -(self.D(x_fake) + _eps).log().mean()
-        if self.lambd != 0:
+        if self.use_E() and self.lambd != 0:
             ret['reconstruction_loss'] = self.lambd*self.rec_loss(x_rec, x)
-        if self.z_lambd != 0:
+        if self.use_E() and self.z_lambd != 0:
             z_rec = self.E(x_fake)
             ret['code_reconstruction_loss'] = self.z_lambd*self.rec_loss(z_rec, zs)
         return ret
@@ -171,7 +171,7 @@ class AlphaGAN(nn.Module):
         iter_losses = defaultdict(list)
         
         it = _take_batches(X, n_batches) if n_batches else X
-        desc = 'training batch' if optimizers else 'validating batch'
+        desc = 'training batch' if optimizers[0] else 'validating batch'
         for x in pbar(it, desc=desc, leave=False):
             x = self._wrap(x)
             for opt, iters, loss_fn in zip(optimizers, n_iter, loss_fns):
@@ -250,7 +250,8 @@ class AlphaGAN(nn.Module):
                 X_train, loss_fns, optimizers, n_iter, train_batches ))
             # validate for one epoch
             self.eval()
-            diagnostic['valid'].update(self._epoch(X_valid, loss_fns, n_batches=valid_batches))
+            diagnostic['valid'].update(self._epoch(
+                X_valid, loss_fns, n_batches=valid_batches ))
             # log the dict of loss components
             if report:
                 log_fn(diagnostic)
@@ -293,103 +294,105 @@ class AlphaGAN(nn.Module):
             self.E and (self.code_weight or self.lambd or self.z_lambd))
     
     def use_C(self):
-        return bool(self.C and self.code_weight)
+        return bool(self.E and self.C and self.code_weight)
     
     def use_D(self):
         return bool(self.D and self.adversarial_weight)
     
-    def _wrap(self, x):
+    def _wrap(self, x, **kwargs):
         """ensure x is a Variable on the correct device"""
         if not isinstance(x, Variable):
             # if x isn't a Tensor, attempt to construct one from it
             if not isinstance(x, torch._TensorBase):
                 x = torch.Tensor(x)
-            x = Variable(x)
+            x = Variable(x, **kwargs)
         if self.is_cuda():
             x = x.cuda()
         return x
 
-# # experiment with using WGAN-GP for the GAN losses
-# # requires pytorch >= 0.2.0
-# class AlphaWGAN(AlphaGAN):
-#     """α-GAN with alternative WGAN-GP based losses"""
+# experiment with using WGAN-GP for the GAN losses
+# requires pytorch >= 0.2.0
+class AlphaWGAN(AlphaGAN):
+    """α-GAN with alternative WGAN-GP based losses"""
     
-#     def gradient_penalty(self, model, x, x_gen, w=10):
-#         """WGAN-GP gradient penalty"""
-#         assert x.size()==x_gen.size(), "real and sampled sizes do not match"
-#         alpha = self._wrap(torch.rand(len(x),*(1,)*(len(x.size())-1)).expand_as(x))
-#         x_hat = x*alpha + x_gen*(1-alpha)
-# #         x_hat = Variable(x_hat.data, requires_grad=True)
+    def gradient_penalty(self, model, x, x_gen, w=10):
+        """WGAN-GP gradient penalty"""
+        assert x.size()==x_gen.size(), "real and sampled sizes do not match"
+        alpha_size = tuple((len(x), *(1,)*(x.dim()-1)))
+        alpha_t = torch.cuda.FloatTensor if x.is_cuda else torch.Tensor
+        alpha = alpha_t(*alpha_size).uniform_()
+        x_hat = x.data*alpha + x_gen.data*(1-alpha)
+        x_hat = Variable(x_hat, requires_grad=True)
 
-#         def eps_norm(x):
-#             x = x.view(len(x), -1)
-#             return (x*x+_eps).sum(-1).sqrt()
-#         def bi_penalty(x):
-#             return (x-1)**2
+        def eps_norm(x):
+            x = x.view(len(x), -1)
+            return (x*x+_eps).sum(-1).sqrt()
+        def bi_penalty(x):
+            return (x-1)**2
 
-#         grad_xhat = torch.autograd.grad(
-#             model(x_hat).sum(), x_hat, create_graph=True, only_inputs=True
-#         )[0]
+        grad_xhat = torch.autograd.grad(
+            model(x_hat).sum(), x_hat, create_graph=True, only_inputs=True
+        )[0]
     
-#         penalty = w*bi_penalty(eps_norm(grad_xhat)).mean()
-#         return penalty
+        penalty = w*bi_penalty(eps_norm(grad_xhat)).mean()
+        return penalty
     
-#     def autoencoder_loss(self, x):
-#         """Return reconstruction loss, adversarial loss"""
-#         _freeze(self) # save memory by excluding parameters from autograd
-#         _unfreeze(self.E, self.G)
+    def autoencoder_loss(self, x):
+        """Return reconstruction loss, adversarial loss"""
+        _freeze(self) # save memory by excluding parameters from autograd
+        _unfreeze(self.E, self.G)
 
-#         z_prior = self.sample_prior(len(x))
-#         if self.use_E(): # encoder case
-#             z = self.E(x)
-#             zs = torch.cat((z_prior, z), 0)
-#             x_fake = self.G(zs)
-#             x_gen, x_rec = x_fake.chunk(2)
-#         else: # no encoder (pure GAN) case
-#             zs = z_prior
-#             x_fake = x_gen = self.G(zs)
+        z_prior = self.sample_prior(len(x))
+        if self.use_E(): # encoder case
+            z = self.E(x)
+            zs = torch.cat((z_prior, z), 0)
+            x_fake = self.G(zs)
+            x_gen, x_rec = x_fake.chunk(2)
+        else: # no encoder (pure GAN) case
+            zs = z_prior
+            x_fake = x_gen = self.G(zs)
         
-#         ret = {}
-#         if self.code_weight != 0:
-#             ret['code_adversarial_loss'] = -self.C(z).mean()
-#         if self.adversarial_weight != 0:
-#             ret['adversarial_loss'] = -self.D(x_fake).mean()
-#         if self.lambd != 0:
-#             ret['reconstruction_loss'] = self.lambd*self.rec_loss(x_rec, x)
-#         if self.z_lambd != 0:
-#             z_rec = self.E(x_fake)
-#             ret['code_reconstruction_loss'] = self.z_lambd*self.rec_loss(z_rec, zs)
-#         return ret
+        ret = {}
+        if self.use_C() != 0:
+            ret['code_adversarial_loss'] = -self.C(z).mean()
+        if self.adversarial_weight != 0:
+            ret['adversarial_loss'] = -self.D(x_fake).mean()
+        if self.use_E() and self.lambd != 0:
+            ret['reconstruction_loss'] = self.lambd*self.rec_loss(x_rec, x)
+        if self.use_E() and self.z_lambd != 0:
+            z_rec = self.E(x_fake)
+            ret['code_reconstruction_loss'] = self.z_lambd*self.rec_loss(z_rec, zs)
+        return ret
 
-#     def discriminator_loss(self, x):
-#         """Return discriminator (D) loss"""
-#         _freeze(self) # save memory by excluding parameters from autograd
-#         _unfreeze(self.D)
-#         z_prior = self.sample_prior(len(x))
-#         if self.use_E(): # encoder case
-#             z = self.E(x)
-#             zs = torch.cat((z_prior, z), 0)
-#             x_real = torch.cat((x,x), 0)
-#         else: # no encoder (pure GAN) case
-#             zs = z_prior
-#             x_real = x
-#         x_fake = self.G(zs)
-#         return {
-#             'D_critic_loss': 
-#                 self.D(x_fake).mean() - self.D(x).mean(),
-#             'D_gradient_penalty':
-#                 self.gradient_penalty(self.D, x_real, x_fake)
-#         }
+    def discriminator_loss(self, x):
+        """Return discriminator (D) loss"""
+        _freeze(self) # save memory by excluding parameters from autograd
+        _unfreeze(self.D)
+        z_prior = self.sample_prior(len(x))
+        if self.use_E(): # encoder case
+            z = self.E(x)
+            zs = torch.cat((z_prior, z), 0)
+            x_real = torch.cat((x,x), 0)
+        else: # no encoder (pure GAN) case
+            zs = z_prior
+            x_real = x
+        x_fake = self.G(zs)
+        return {
+            'D_critic_loss': 
+                self.D(x_fake).mean() - self.D(x).mean(),
+            'D_gradient_penalty':
+                self.gradient_penalty(self.D, x_real, x_fake)
+        }
 
-#     def code_discriminator_loss(self, x):
-#         """Return code discriminator (C) loss"""
-#         _freeze(self) # save memory by excluding parameters from autograd
-#         _unfreeze(self.C)
-#         z_prior = self.sample_prior(len(x))
-#         z = self.E(x)
-#         return {
-#             'C_critic_loss': 
-#                 self.C(z).mean() - self.C(z_prior).mean(),
-#             'C_gradient_penalty':
-#                 self.gradient_penalty(self.C, z, z_prior)
-#         }
+    def code_discriminator_loss(self, x):
+        """Return code discriminator (C) loss"""
+        _freeze(self) # save memory by excluding parameters from autograd
+        _unfreeze(self.C)
+        z_prior = self.sample_prior(len(x))
+        z = self.E(x)
+        return {
+            'C_critic_loss': 
+                self.C(z).mean() - self.C(z_prior).mean(),
+            'C_gradient_penalty':
+                self.gradient_penalty(self.C, z, z_prior)
+        }

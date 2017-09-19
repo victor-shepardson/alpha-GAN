@@ -9,7 +9,7 @@ In the original paper (v1 on arXiv), prior and posterior terms are swapped in th
 
 Algorithm 1 in the paper is vague as to how each network should be updated; it doesn't account for SGD. The authors have confirmed that each of the four networks is updated separately in their experiments. However, in this implementation, encoder and generator (E and G networks) are updated jointly and share an optimizer. It may be worth revisiting the sequence and separation of optimizers.
 
-This implementation adds the latent space cycle loss alluded to in the paper via an option hyperparameter `z_lambd`. When `z_lambd` is nonzero, generated and reconstructed _x_ will be run through the encoder and compared to the original sampled and encoded z.
+This implementation adds the latent space cycle loss alluded to in the paper via an optional hyperparameter `z_lambd`. When `z_lambd` is nonzero, generated and reconstructed _x_ will be run through the encoder and compared to the original sampled and encoded _z_.
 
 ## Basic Usage
 
@@ -18,7 +18,7 @@ from alphagan import AlphaGAN
 
 E, G, D, C = ... #torch.nn.Module
 
-model = AlphaGAN(E, G, D, C, lambd=10, latent_dim=32)
+model = AlphaGAN(E, G, D, C, lambd=10, latent_dim=128)
 if use_gpu:
   model = model.cuda()
 
@@ -35,7 +35,7 @@ z_valid, x_recon = model(X_valid[:batch_size])
 z, x_gen = model(batch_size, mode='sample')
 ```
 
-Supply any torch.nn.Module encoder, generator, discriminator, and code discriminator at construction and any torch.optim.Optimizer and torch.utils.DataLoader to fit().
+Supply any torch.nn.Module encoder, generator, discriminator, and code discriminator at construction and any torch.optim.Optimizer constructors and torch.utils.DataLoader to fit().
 
 ## Examples
 
